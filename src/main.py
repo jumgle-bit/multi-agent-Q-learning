@@ -1,15 +1,13 @@
 """
-Multi-Agent Q-learning Task Scheduler v1.0
+Multi-Agent Q-learning Scheduler v2.0
 
-Static first version:
-- 3 agents: A, B, C
-- 5 tasks: a, b, c, d, e
-- All agents start at (0, 0)
-- Goal is (5, 5)
-- Each grid movement costs 2 seconds
-- Each task has location, duration, and capability constraints
-- Q-learning learns which agent should do which task and when to go to goal
-- Episode succeeds only when all 5 tasks are completed and all agents reach goal
+v2.0 features:
+- Multi-agent static + dynamic task scheduling.
+- Three robots A/B/C start at (0, 0), final goal is (5, 5).
+- Initial tasks a-e must be completed; a dynamic task f can appear during scheduling.
+- Q-learning learns which robot should do which task; task ownership is not hard-coded.
+- Event-triggered exploration: when a dynamic task appears, epsilon is boosted.
+- Tkinter visualization for learning process, learned assignment, paths, and Q updates.
 
 Run:
     python src/main.py
@@ -17,82 +15,159 @@ Run:
 
 from __future__ import annotations
 
-import csv
 import random
 import tkinter as tk
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
-from tkinter import scrolledtext, ttk, messagebox
-from typing import Dict, List, Optional, Tuple
+from tkinter import scrolledtext, ttk
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 Position = Tuple[int, int]
-State = Tuple[Tuple[Position, Position, Position], int, int, Tuple[int, int, int]]
+State = Tuple[Tuple[Position, ...], int, int, int, Tuple[int, ...]]
+# State = (positions, active_mask, completed_mask, done_mask, times)
 
 
 @dataclass(frozen=True)
-class Task:
+class TaskSpec:
     name: str
     pos: Position
     duration: int
-    capable: Tuple[str, ...]
+    priority: int
+    capable: Set[str]
+    initial_active: bool = True
+    appear_step: Optional[int] = None
+    description: str = ""
 
 
-@dataclass
-class StepRecord:
-    state: State
-    action_index: int
-    next_state: State
-    reward: float
-    done: bool
-    info: dict
-    old_q: float
-    next_max_q: float
-    target: float
-    td_error: float
-    new_q: float
-    choose_reason: str
+class DynamicMultiAgentQLearningGUI:
+    """
+    v2.0: dynamic multi-robot task scheduling with continuous exploration.
 
+    Difference from v1.0:
+    - v1.0: all tasks are known at the beginning.
+    - v2.0: task f can appear during an episode as an event-triggered dynamic task.
+    - When the event occurs, epsilon is boosted to keep exploration active.
+    """
 
-class MultiAgentTaskEnv:
-    """Static multi-agent task scheduling environment."""
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        self.root.title("Multi-Agent Q-learning v2.0 - Dynamic Task Scheduling")
+        self.root.geometry("1360x860")
 
-    def __init__(self) -> None:
+        # =========================
+        # 1. Environment definition
+        # =========================
         self.grid_size = 6  # coordinates 0..5
         self.start_pos: Position = (0, 0)
         self.goal_pos: Position = (5, 5)
         self.move_time_per_grid = 2
 
-        self.agents = ("A", "B", "C")
-        self.agent_index = {ag: i for i, ag in enumerate(self.agents)}
+        self.agents = ["A", "B", "C"]
+        self.agent_index = {ag: idx for idx, ag in enumerate(self.agents)}
 
-        self.tasks: Dict[str, Task] = {
-            "a": Task("a", (0, 2), 2, ("A",)),
-            "b": Task("b", (2, 4), 3, ("A", "B")),
-            "c": Task("c", (3, 4), 4, ("A", "B", "C")),
-            "d": Task("d", (1, 3), 1, ("B", "C")),
-            "e": Task("e", (5, 3), 5, ("C",)),
+        # Initial tasks a-e + dynamic task f.
+        # The RL agent does NOT know the final assignment; it only knows legal candidate actions.
+        self.tasks: Dict[str, TaskSpec] = {
+            "a": TaskSpec("a", (0, 2), duration=2, priority=2, capable={"A"}, initial_active=True,
+                          description="initial task, only A can do it"),
+            "b": TaskSpec("b", (2, 4), duration=3, priority=3, capable={"A", "B"}, initial_active=True,
+                          description="initial task, A/B can do it"),
+            "c": TaskSpec("c", (3, 4), duration=4, priority=4, capable={"A", "B", "C"}, initial_active=True,
+                          description="initial task, A/B/C can do it"),
+            "d": TaskSpec("d", (1, 3), duration=1, priority=2, capable={"B", "C"}, initial_active=True,
+                          description="initial task, B/C can do it"),
+            "e": TaskSpec("e", (5, 3), duration=5, priority=5, capable={"C"}, initial_active=True,
+                          description="initial task, only C can do it"),
+            "f": TaskSpec("f", (4, 1), duration=3, priority=6, capable={"A", "C"}, initial_active=False,
+                          appear_step=3, description="dynamic task, appears after several decisions"),
         }
-        self.task_names = tuple(self.tasks.keys())
-        self.task_index = {name: i for i, name in enumerate(self.task_names)}
+        self.task_names = list(self.tasks.keys())
+        self.task_index = {name: idx for idx, name in enumerate(self.task_names)}
 
-        self.all_tasks_mask = (1 << len(self.task_names)) - 1
+        self.initial_active_mask = 0
+        for t in self.task_names:
+            if self.tasks[t].initial_active:
+                self.initial_active_mask |= self.bit_task(t)
+
         self.all_agents_done_mask = (1 << len(self.agents)) - 1
 
-        # Candidate macro-actions. This is NOT a fixed assignment.
-        # Q-learning chooses among these actions according to Q-values.
-        self.targets = self.task_names + ("GOAL",)
+        # Action = choose one robot to do one task or go to GOAL.
+        # This is only the candidate action space, not a fixed assignment.
+        self.targets = self.task_names + ["GOAL"]
         self.actions: List[Tuple[str, str]] = []
         for ag in self.agents:
             for target in self.targets:
                 self.actions.append((ag, target))
+        self.action_count = len(self.actions)
 
-    def start_state(self) -> State:
-        positions = tuple(self.start_pos for _ in self.agents)  # type: ignore[assignment]
+        # =========================
+        # 2. Q-learning parameters
+        # =========================
+        self.alpha = tk.DoubleVar(value=0.25)
+        self.gamma = tk.DoubleVar(value=0.95)
+        self.epsilon = tk.DoubleVar(value=1.00)
+        self.target_epsilon = tk.DoubleVar(value=0.05)
+        self.epsilon_min = 0.03
+        self.epsilon_decay = 0.995
+        self.event_epsilon_boost = tk.DoubleVar(value=0.35)
+        self.stagnation_boost_after = tk.IntVar(value=200)
+
+        self.invalid_penalty = -120.0
+        self.success_bonus = 220.0
+        self.task_reward_scale = 9.0
+        self.max_steps_per_episode = 12
+
+        # Q table: sparse dictionary, state -> Q values of all macro-actions.
+        self.Q = defaultdict(lambda: [0.0 for _ in range(self.action_count)])
+
+        # =========================
+        # 3. Runtime state
+        # =========================
+        self.start_state = self.make_start_state()
+        self.state: State = self.start_state
+        self.display_state: Optional[State] = None
+
+        self.episode = 1
+        self.total_steps = 0
+        self.episode_steps = 0
+        self.done = False
+        self.current_episode_plan = []
+        self.last_transition = None
+        self.last_move_path: Optional[List[Position]] = None
+        self.event_log: List[str] = []
+
+        self.best_solution = None
+        self.episodes_since_best = 0
+
+        self.auto_running = False
+        self.demo_running = False
+        self.demo_plan = []
+        self.demo_index = 0
+
+        self.build_ui()
+        self.draw_grid()
+        self.update_action_table()
+        self.update_status("v2.0 已启动：初始任务 a-e 激活，动态任务 f 会在本回合第 3 个宏动作后出现。")
+
+    # ============================================================
+    # Basic state helpers
+    # ============================================================
+    def bit_task(self, task_name: str) -> int:
+        return 1 << self.task_index[task_name]
+
+    def bit_agent(self, agent_name: str) -> int:
+        return 1 << self.agent_index[agent_name]
+
+    def make_start_state(self) -> State:
+        positions = tuple([self.start_pos for _ in self.agents])
+        active_mask = self.initial_active_mask
         completed_mask = 0
         done_mask = 0
-        times = tuple(0 for _ in self.agents)  # type: ignore[assignment]
-        return positions, completed_mask, done_mask, times
+        times = tuple([0 for _ in self.agents])
+        return positions, active_mask, completed_mask, done_mask, times
+
+    def current_display_state(self) -> State:
+        return self.display_state if self.display_state is not None else self.state
 
     def manhattan(self, p1: Position, p2: Position) -> int:
         return abs(p1[0] - p2[0]) + abs(p1[1] - p2[1])
@@ -100,86 +175,149 @@ class MultiAgentTaskEnv:
     def travel_time(self, p1: Position, p2: Position) -> int:
         return self.manhattan(p1, p2) * self.move_time_per_grid
 
-    def task_completed(self, completed_mask: int, task_name: str) -> bool:
-        return (completed_mask & (1 << self.task_index[task_name])) != 0
-
-    def set_task_completed(self, completed_mask: int, task_name: str) -> int:
-        return completed_mask | (1 << self.task_index[task_name])
-
-    def agent_done(self, done_mask: int, agent_name: str) -> bool:
-        return (done_mask & (1 << self.agent_index[agent_name])) != 0
-
-    def set_agent_done(self, done_mask: int, agent_name: str) -> int:
-        return done_mask | (1 << self.agent_index[agent_name])
-
-    def completed_task_names(self, completed_mask: int) -> List[str]:
-        return [name for name in self.task_names if self.task_completed(completed_mask, name)]
-
-    def remaining_task_names(self, completed_mask: int) -> List[str]:
-        return [name for name in self.task_names if not self.task_completed(completed_mask, name)]
-
-    def makespan(self, times: Tuple[int, int, int]) -> int:
+    def makespan(self, times: Sequence[int]) -> int:
         return max(times)
 
+    def task_active(self, active_mask: int, task_name: str) -> bool:
+        return (active_mask & self.bit_task(task_name)) != 0
+
+    def activate_task(self, active_mask: int, task_name: str) -> int:
+        return active_mask | self.bit_task(task_name)
+
+    def task_completed(self, completed_mask: int, task_name: str) -> bool:
+        return (completed_mask & self.bit_task(task_name)) != 0
+
+    def set_task_completed(self, completed_mask: int, task_name: str) -> int:
+        return completed_mask | self.bit_task(task_name)
+
+    def agent_done(self, done_mask: int, agent_name: str) -> bool:
+        return (done_mask & self.bit_agent(agent_name)) != 0
+
+    def set_agent_done(self, done_mask: int, agent_name: str) -> int:
+        return done_mask | self.bit_agent(agent_name)
+
+    def active_task_names(self, active_mask: int) -> List[str]:
+        return [t for t in self.task_names if self.task_active(active_mask, t)]
+
+    def inactive_task_names(self, active_mask: int) -> List[str]:
+        return [t for t in self.task_names if not self.task_active(active_mask, t)]
+
+    def completed_task_names(self, active_mask: int, completed_mask: int) -> List[str]:
+        return [t for t in self.active_task_names(active_mask) if self.task_completed(completed_mask, t)]
+
+    def remaining_task_names(self, active_mask: int, completed_mask: int) -> List[str]:
+        return [t for t in self.active_task_names(active_mask) if not self.task_completed(completed_mask, t)]
+
     def is_terminal_success(self, state: State) -> bool:
-        _positions, completed_mask, done_mask, _times = state
-        return completed_mask == self.all_tasks_mask and done_mask == self.all_agents_done_mask
+        positions, active_mask, completed_mask, done_mask, times = state
+        active_done = (completed_mask & active_mask) == active_mask
+        return active_done and done_mask == self.all_agents_done_mask
 
-    def remaining_tasks_coverable_after_done(self, completed_mask: int, new_done_mask: int) -> bool:
-        """Prevent a robot from going to goal if remaining tasks would become impossible."""
-        for task_name in self.remaining_task_names(completed_mask):
-            capable_agents = self.tasks[task_name].capable
-            if not any(not self.agent_done(new_done_mask, ag) for ag in capable_agents):
-                return False
-        return True
+    def format_action(self, action_index: int) -> str:
+        ag, target = self.actions[action_index]
+        if target == "GOAL":
+            return f"{ag} → 终点"
+        return f"{ag} → 任务{target}"
 
+    def format_state_short(self, state: State) -> str:
+        positions, active_mask, completed_mask, done_mask, times = state
+        active = self.active_task_names(active_mask)
+        completed = self.completed_task_names(active_mask, completed_mask)
+        remaining = self.remaining_task_names(active_mask, completed_mask)
+        done_agents = [ag for ag in self.agents if self.agent_done(done_mask, ag)]
+        return f"pos={positions}, active={active}, doneTask={completed}, remaining={remaining}, goal={done_agents}, t={times}"
+
+    # ============================================================
+    # Dynamic event and continuous exploration
+    # ============================================================
+    def maybe_trigger_dynamic_event(self) -> None:
+        """Automatically activate task f after a fixed number of decisions in each episode."""
+        positions, active_mask, completed_mask, done_mask, times = self.state
+
+        task_f = self.tasks["f"]
+        if task_f.appear_step is None:
+            return
+        if self.task_active(active_mask, "f"):
+            return
+        if self.episode_steps < task_f.appear_step:
+            return
+        if self.done:
+            return
+
+        new_active_mask = self.activate_task(active_mask, "f")
+        self.state = (positions, new_active_mask, completed_mask, done_mask, times)
+        msg = f"事件触发：动态任务 f 在第 {self.episode} 回合第 {self.episode_steps} 个宏动作后出现。"
+        self.event_log.append(msg)
+        self.log("\n" + msg + "\n")
+        self.boost_exploration("动态任务出现")
+
+    def manual_trigger_dynamic_task(self) -> None:
+        positions, active_mask, completed_mask, done_mask, times = self.state
+        if self.task_active(active_mask, "f"):
+            self.log("\n动态任务 f 已经处于激活状态，无需重复触发。\n")
+            return
+        self.state = (positions, self.activate_task(active_mask, "f"), completed_mask, done_mask, times)
+        msg = f"手动事件：动态任务 f 被激活。"
+        self.event_log.append(msg)
+        self.log("\n" + msg + "\n")
+        self.boost_exploration("手动动态任务")
+        self.draw_grid()
+        self.update_action_table()
+        self.update_status("动态任务 f 已激活，epsilon 已提升以继续探索。")
+
+    def boost_exploration(self, reason: str) -> None:
+        old_eps = self.epsilon.get()
+        boost = self.event_epsilon_boost.get()
+        new_eps = max(old_eps, boost)
+        self.epsilon.set(round(new_eps, 5))
+        self.log(f"持续探索机制：由于 {reason}，ε 从 {old_eps:.5f} 提升/保持到 {new_eps:.5f}\n")
+
+    def maybe_stagnation_boost(self) -> None:
+        threshold = self.stagnation_boost_after.get()
+        if threshold <= 0:
+            return
+        if self.episodes_since_best > 0 and self.episodes_since_best % threshold == 0:
+            self.boost_exploration(f"连续 {threshold} 回合没有更优方案")
+
+    # ============================================================
+    # Legal actions and transition
+    # ============================================================
     def legal_actions(self, state: State) -> List[int]:
-        positions, completed_mask, done_mask, _times = state
+        positions, active_mask, completed_mask, done_mask, times = state
         if self.is_terminal_success(state):
             return []
 
-        legal: List[int] = []
+        remaining = self.remaining_task_names(active_mask, completed_mask)
+        legal = []
         for idx, (ag, target) in enumerate(self.actions):
             if self.agent_done(done_mask, ag):
                 continue
 
             if target == "GOAL":
-                new_done_mask = self.set_agent_done(done_mask, ag)
-                if self.remaining_tasks_coverable_after_done(completed_mask, new_done_mask):
+                # v2.0 baseline: robots go to the final goal only after all active tasks have been completed.
+                if not remaining:
                     legal.append(idx)
                 continue
 
-            task = self.tasks[target]
+            # Task target: must be active, unfinished, and the robot must be capable.
+            if not self.task_active(active_mask, target):
+                continue
             if self.task_completed(completed_mask, target):
                 continue
-            if ag not in task.capable:
+            if ag not in self.tasks[target].capable:
                 continue
-
             legal.append(idx)
 
         return legal
 
-    def grid_path(self, start: Position, end: Position) -> List[Position]:
-        """Simple Manhattan path for visualization: row direction first, then column."""
-        path = [start]
-        r, c = start
-        er, ec = end
-        while r != er:
-            r += 1 if er > r else -1
-            path.append((r, c))
-        while c != ec:
-            c += 1 if ec > c else -1
-            path.append((r, c))
-        return path
-
-    def transition(self, state: State, action_index: int) -> Tuple[State, float, bool, dict]:
-        positions, completed_mask, done_mask, times = state
+    def transition(self, state: State, action_index: int):
+        positions, active_mask, completed_mask, done_mask, times = state
         old_makespan = self.makespan(times)
 
         if action_index not in self.legal_actions(state):
             info = {
                 "valid": False,
-                "reason": "非法动作：能力不匹配、任务已完成，或会导致剩余任务无人可做",
+                "reason": "非法动作：任务未激活/已完成/能力不匹配，或尚有任务未完成却去终点",
                 "move_time": 0,
                 "task_time": 0,
                 "action_time": 0,
@@ -187,10 +325,9 @@ class MultiAgentTaskEnv:
                 "new_makespan": old_makespan,
                 "delta_makespan": 0,
                 "path": [],
-                "agent": None,
-                "target": None,
+                "completed_task": None,
             }
-            return state, -100.0, False, info
+            return state, self.invalid_penalty, False, info
 
         ag, target = self.actions[action_index]
         ag_i = self.agent_index[ag]
@@ -200,6 +337,7 @@ class MultiAgentTaskEnv:
         new_times = list(times)
         new_completed_mask = completed_mask
         new_done_mask = done_mask
+        completed_task = None
 
         if target == "GOAL":
             target_pos = self.goal_pos
@@ -209,7 +347,8 @@ class MultiAgentTaskEnv:
             new_positions[ag_i] = target_pos
             new_times[ag_i] += action_t
             new_done_mask = self.set_agent_done(done_mask, ag)
-            reason = f"{ag} 去终点：从 {old_pos} 到 {target_pos}，移动耗时 {move_t}s"
+            reason = f"{ag} 前往终点：{old_pos} → {target_pos}，移动耗时 {move_t}s"
+            base_reward = -float(max(new_times) - old_makespan)
         else:
             task = self.tasks[target]
             target_pos = task.pos
@@ -219,26 +358,24 @@ class MultiAgentTaskEnv:
             new_positions[ag_i] = target_pos
             new_times[ag_i] += action_t
             new_completed_mask = self.set_task_completed(completed_mask, target)
+            completed_task = target
             reason = (
-                f"{ag} 选择完成任务 {target}：从 {old_pos} 到 {target_pos}，"
-                f"移动 {move_t}s，执行任务 {task_t}s"
+                f"{ag} 自主选择任务{target}：{old_pos} → {target_pos}，"
+                f"移动 {move_t}s，执行 {task_t}s，优先级 {task.priority}"
             )
+            # Reward balances task priority and makespan increase.
+            base_reward = task.priority * self.task_reward_scale - float(max(new_times) - old_makespan)
 
-        new_state: State = (tuple(new_positions), new_completed_mask, new_done_mask, tuple(new_times))  # type: ignore[arg-type]
-        new_makespan = self.makespan(tuple(new_times))  # type: ignore[arg-type]
+        new_state: State = (tuple(new_positions), active_mask, new_completed_mask, new_done_mask, tuple(new_times))
+        new_makespan = self.makespan(tuple(new_times))
         delta_makespan = new_makespan - old_makespan
 
-        # Basic objective: minimize total completion time.
-        reward = -float(delta_makespan)
+        reward = base_reward
         done = False
-
-        if target != "GOAL":
-            reward += 2.0  # small shaping reward for completing a task
-
         if self.is_terminal_success(new_state):
             done = True
-            reward += 100.0
-            reason += "；五个任务全部完成，且 A/B/C 均到达终点"
+            reward += self.success_bonus
+            reason += "；所有已激活任务完成，A/B/C 均到达终点"
 
         info = {
             "valid": True,
@@ -250,229 +387,177 @@ class MultiAgentTaskEnv:
             "new_makespan": new_makespan,
             "delta_makespan": delta_makespan,
             "path": self.grid_path(old_pos, target_pos),
-            "agent": ag,
-            "target": target,
+            "completed_task": completed_task,
         }
         return new_state, reward, done, info
 
-    def format_action(self, action_index: int) -> str:
-        ag, target = self.actions[action_index]
-        return f"{ag} → 终点" if target == "GOAL" else f"{ag} → 任务{target}"
+    def grid_path(self, start: Position, end: Position) -> List[Position]:
+        path = [start]
+        r, c = start
+        er, ec = end
+        while r != er:
+            r += 1 if er > r else -1
+            path.append((r, c))
+        while c != ec:
+            c += 1 if ec > c else -1
+            path.append((r, c))
+        return path
 
-    def format_state_short(self, state: State) -> str:
-        positions, completed_mask, done_mask, times = state
-        completed = self.completed_task_names(completed_mask)
-        remaining = self.remaining_task_names(completed_mask)
-        done_agents = [ag for ag in self.agents if self.agent_done(done_mask, ag)]
-        return f"pos={positions}, 已完成={completed}, 剩余={remaining}, 到终点={done_agents}, t={times}"
-
-
-class QLearningScheduler:
-    def __init__(self, env: MultiAgentTaskEnv) -> None:
-        self.env = env
-        self.Q = defaultdict(lambda: [0.0 for _ in range(len(env.actions))])
-
-    def choose_action(self, state: State, epsilon: float) -> Tuple[Optional[int], str]:
-        legal = self.env.legal_actions(state)
+    # ============================================================
+    # Q-learning
+    # ============================================================
+    def choose_action(self, state: State):
+        legal = self.legal_actions(state)
         if not legal:
             return None, "无合法动作"
 
-        if random.random() < epsilon:
-            return random.choice(legal), "探索：随机选择一个合法动作"
+        eps = self.epsilon.get()
+        if random.random() < eps:
+            return random.choice(legal), "探索：随机选择一个合法宏动作"
 
         q_values = self.Q[state]
         best_q = max(q_values[i] for i in legal)
         best_actions = [i for i in legal if abs(q_values[i] - best_q) < 1e-12]
         chosen = random.choice(best_actions)
         if len(best_actions) > 1:
-            return chosen, "利用：在并列最大Q值动作中随机选择"
-        return chosen, "利用：选择当前最大Q值动作"
+            return chosen, "利用：在并列最大 Q 值动作中随机选择"
+        return chosen, "利用：选择当前最大 Q 值动作"
 
-    def update(
-        self,
-        state: State,
-        action_index: int,
-        reward: float,
-        next_state: State,
-        done: bool,
-        alpha: float,
-        gamma: float,
-    ) -> Tuple[float, float, float, float, float]:
-        old_q = self.Q[state][action_index]
-        next_legal = self.env.legal_actions(next_state)
-        next_max_q = 0.0 if done or not next_legal else max(self.Q[next_state][i] for i in next_legal)
-        target = reward + gamma * next_max_q
-        td_error = target - old_q
-        new_q = old_q + alpha * td_error
-        self.Q[state][action_index] = new_q
-        return old_q, next_max_q, target, td_error, new_q
-
-
-class App:
-    def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.root.title("v1.0 多机器人 Q-learning 任务调度")
-        self.root.geometry("1320x850")
-
-        self.env = MultiAgentTaskEnv()
-        self.agent = QLearningScheduler(self.env)
-
-        # RL parameters
-        self.alpha = tk.DoubleVar(value=0.25)
-        self.gamma = tk.DoubleVar(value=0.95)
-        self.epsilon = tk.DoubleVar(value=1.00)
-        self.target_epsilon = tk.DoubleVar(value=0.05)
-        self.epsilon_min = 0.02
-        self.epsilon_decay = 0.995
-
-        self.state = self.env.start_state()
-        self.display_state: Optional[State] = None
-        self.done = False
-        self.episode = 1
-        self.total_steps = 0
-        self.episode_steps = 0
-        self.max_steps_per_episode = 10
-
-        self.last_transition: Optional[StepRecord] = None
-        self.last_move_path: List[Position] = []
-        self.current_episode_plan: List[StepRecord] = []
-        self.best_solution: Optional[dict] = None
-        self.episode_results: List[dict] = []
-
-        self.auto_running = False
-        self.demo_running = False
-        self.demo_plan: List[StepRecord] = []
-        self.demo_index = 0
-
-        self.build_ui()
-        self.draw_grid()
-        self.update_action_table()
-        self.update_status("v1.0 已启动：静态 3机器人-5任务调度，Q-learning 自主学习任务归属。")
-
-    # ---------------------- core train logic ----------------------
-    def current_display_state(self) -> State:
-        return self.display_state if self.display_state is not None else self.state
-
-    def train_one_step(self) -> None:
+    def train_one_step(self):
         if self.demo_running:
             return
-        self.display_state = None
 
+        self.display_state = None
         if self.done or self.episode_steps >= self.max_steps_per_episode:
             self.new_episode(clear_log=False)
 
+        # Trigger event before action selection if the condition is already met.
+        self.maybe_trigger_dynamic_event()
+
         state = self.state
-        action_index, choose_reason = self.agent.choose_action(state, self.epsilon.get())
+        action_index, choose_reason = self.choose_action(state)
         if action_index is None:
             self.finish_episode("失败：无合法动作")
             return
 
-        next_state, reward, done, info = self.env.transition(state, action_index)
-        old_q, next_max_q, target, td_error, new_q = self.agent.update(
-            state,
-            action_index,
-            reward,
-            next_state,
-            done,
-            self.alpha.get(),
-            self.gamma.get(),
-        )
+        next_state, reward, done, info = self.transition(state, action_index)
 
-        record = StepRecord(
-            state=state,
-            action_index=action_index,
-            next_state=next_state,
-            reward=reward,
-            done=done,
-            info=info,
-            old_q=old_q,
-            next_max_q=next_max_q,
-            target=target,
-            td_error=td_error,
-            new_q=new_q,
-            choose_reason=choose_reason,
-        )
+        old_q = self.Q[state][action_index]
+        next_legal = self.legal_actions(next_state)
+        if done or not next_legal:
+            next_max_q = 0.0
+        else:
+            next_max_q = max(self.Q[next_state][i] for i in next_legal)
+
+        alpha = self.alpha.get()
+        gamma = self.gamma.get()
+        target = reward + gamma * next_max_q
+        td_error = target - old_q
+        new_q = old_q + alpha * td_error
+        self.Q[state][action_index] = new_q
 
         self.state = next_state
         self.done = done
         self.total_steps += 1
         self.episode_steps += 1
-        self.last_transition = record
-        self.last_move_path = info.get("path", [])
-        self.current_episode_plan.append(record)
+        self.last_move_path = info["path"]
 
-        self.log_transition(record)
+        self.last_transition = {
+            "state": state,
+            "action_index": action_index,
+            "next_state": next_state,
+            "reward": reward,
+            "done": done,
+            "info": info,
+            "old_q": old_q,
+            "next_max_q": next_max_q,
+            "target": target,
+            "td_error": td_error,
+            "new_q": new_q,
+            "choose_reason": choose_reason,
+        }
+        self.current_episode_plan.append(self.last_transition.copy())
+        self.log_transition()
+
+        # Trigger event immediately after the action if the appearance step has just been reached.
+        if not done:
+            self.maybe_trigger_dynamic_event()
 
         if done:
-            final_time = self.env.makespan(next_state[3])
+            final_time = self.makespan(next_state[4])
             self.record_success(final_time)
-            self.finish_episode(f"成功：五个任务全部完成，总时间 {final_time}s")
+            self.finish_episode(f"成功：全部激活任务完成，总时间 {final_time}s")
         elif self.episode_steps >= self.max_steps_per_episode:
-            self.finish_episode("达到本回合最大动作数，未完成则结束")
+            self.finish_episode("达到最大宏动作数，本回合结束")
 
         self.draw_grid()
         self.update_action_table()
         self.update_status()
+
+    def record_success(self, final_time: int) -> None:
+        plan = [item.copy() for item in self.current_episode_plan]
+        if self.best_solution is None or final_time < self.best_solution["time"]:
+            self.best_solution = {
+                "time": final_time,
+                "episode": self.episode,
+                "plan": plan,
+            }
+            self.episodes_since_best = 0
+            self.log(f"\n发现历史最好方案：总时间 {final_time}s，来自第 {self.episode} 回合。\n")
+            self.log(self.solution_summary_text(plan, final_time) + "\n")
+        else:
+            self.episodes_since_best += 1
 
     def finish_episode(self, reason: str) -> None:
         old_eps = self.epsilon.get()
         new_eps = max(self.epsilon_min, old_eps * self.epsilon_decay)
         self.epsilon.set(round(new_eps, 5))
         self.done = True
-
-        final_time = self.env.makespan(self.state[3])
-        success = self.env.is_terminal_success(self.state)
-        self.episode_results.append(
-            {"episode": self.episode, "success": success, "time": final_time, "epsilon": new_eps, "reason": reason}
-        )
-
         self.log(f"\n第 {self.episode} 回合结束：{reason}。ε 从 {old_eps:.5f} 衰减到 {new_eps:.5f}\n")
+        self.maybe_stagnation_boost()
 
     def new_episode(self, clear_log: bool = True) -> None:
-        self.state = self.env.start_state()
+        self.state = self.start_state
         self.display_state = None
         self.done = False
         self.episode += 1
         self.episode_steps = 0
         self.last_transition = None
-        self.last_move_path = []
+        self.last_move_path = None
         self.current_episode_plan = []
+        self.event_log = []
         if clear_log:
-            self.log(f"\n新开第 {self.episode} 回合：A、B、C 回到 (0,0)，Q 表保留。\n")
+            self.log(f"\n新开第 {self.episode} 回合：机器人回到 (0,0)，初始任务 a-e 激活，动态任务 f 等待触发。\n")
         self.draw_grid()
         self.update_action_table()
         self.update_status()
-
-    def record_success(self, final_time: int) -> None:
-        plan_copy = list(self.current_episode_plan)
-        if self.best_solution is None or final_time < self.best_solution["time"]:
-            self.best_solution = {"time": final_time, "episode": self.episode, "plan": plan_copy}
-            self.log(f"\n发现历史最好方案：总时间 {final_time}s，来自第 {self.episode} 回合。\n")
-            self.log(self.solution_summary_text(plan_copy, final_time) + "\n")
 
     def reset_all(self) -> None:
         self.stop_auto()
-        self.agent = QLearningScheduler(self.env)
-        self.state = self.env.start_state()
+        self.Q = defaultdict(lambda: [0.0 for _ in range(self.action_count)])
+        self.state = self.start_state
         self.display_state = None
-        self.done = False
         self.episode = 1
         self.total_steps = 0
         self.episode_steps = 0
-        self.last_transition = None
-        self.last_move_path = []
+        self.done = False
         self.current_episode_plan = []
+        self.last_transition = None
+        self.last_move_path = None
+        self.event_log = []
         self.best_solution = None
-        self.episode_results = []
+        self.episodes_since_best = 0
         self.epsilon.set(1.00)
         self.target_epsilon.set(0.05)
         self.log_box.delete("1.0", tk.END)
-        self.log("已重置：Q表清空，训练重新开始。\n")
+        self.log("已重置：Q 表清空，v2.0 动态任务环境重新开始。\n")
         self.draw_grid()
         self.update_action_table()
         self.update_status()
 
-    # ---------------------- auto train ----------------------
+    # ============================================================
+    # Auto training
+    # ============================================================
     def auto_train_episodes(self, n: int) -> None:
         if self.demo_running:
             return
@@ -480,9 +565,9 @@ class App:
         self.auto_episodes_left = n
         if self.done:
             self.new_episode(clear_log=False)
-        self.auto_episode_loop()
+        self.auto_episode_batch_loop()
 
-    def auto_episode_loop(self) -> None:
+    def auto_episode_batch_loop(self) -> None:
         if not self.auto_running:
             return
         if self.auto_episodes_left <= 0:
@@ -490,11 +575,13 @@ class App:
             self.update_status("自动训练完成。")
             return
 
+        before_episode = self.episode
         self.train_one_step()
-        if self.done:
+        if self.done and self.episode == before_episode:
             self.auto_episodes_left -= 1
+        if self.done:
             self.new_episode(clear_log=False)
-        self.root.after(2, self.auto_episode_loop)
+        self.root.after(2, self.auto_episode_batch_loop)
 
     def auto_train_until_epsilon(self) -> None:
         if self.demo_running:
@@ -521,24 +608,35 @@ class App:
         self.train_one_step()
         if self.done:
             self.new_episode(clear_log=False)
-        self.root.after(2, self.auto_until_epsilon_loop)
+        self.root.after(1, self.auto_until_epsilon_loop)
 
     def stop_auto(self) -> None:
         self.auto_running = False
         self.demo_running = False
 
-    # ---------------------- demo ----------------------
-    def greedy_plan_from_q(self, max_steps: int = 20) -> List[StepRecord]:
-        state = self.env.start_state()
-        plan: List[StepRecord] = []
+    # ============================================================
+    # Demo and solution summary
+    # ============================================================
+    def greedy_plan_from_q(self, max_steps: int = 24):
+        state = self.start_state
+        plan = []
         visited = set()
+        simulated_episode_steps = 0
+
         for _ in range(max_steps):
-            if self.env.is_terminal_success(state):
+            # Apply the same dynamic event rule in greedy simulation.
+            positions, active_mask, completed_mask, done_mask, times = state
+            if simulated_episode_steps >= (self.tasks["f"].appear_step or 999999):
+                if not self.task_active(active_mask, "f"):
+                    active_mask = self.activate_task(active_mask, "f")
+                    state = (positions, active_mask, completed_mask, done_mask, times)
+
+            if self.is_terminal_success(state):
                 break
-            legal = self.env.legal_actions(state)
+            legal = self.legal_actions(state)
             if not legal:
                 break
-            q_values = self.agent.Q[state]
+            q_values = self.Q[state]
             best_q = max(q_values[i] for i in legal)
             best_actions = [i for i in legal if abs(q_values[i] - best_q) < 1e-12]
             action_index = random.choice(best_actions)
@@ -546,56 +644,55 @@ class App:
             if key in visited:
                 break
             visited.add(key)
-            next_state, reward, done, info = self.env.transition(state, action_index)
-            record = StepRecord(
-                state=state,
-                action_index=action_index,
-                next_state=next_state,
-                reward=reward,
-                done=done,
-                info=info,
-                old_q=self.agent.Q[state][action_index],
-                next_max_q=0.0,
-                target=0.0,
-                td_error=0.0,
-                new_q=self.agent.Q[state][action_index],
-                choose_reason="演示：按当前Q表贪心选择",
-            )
-            plan.append(record)
+            next_state, reward, done, info = self.transition(state, action_index)
+            item = {
+                "state": state,
+                "action_index": action_index,
+                "next_state": next_state,
+                "reward": reward,
+                "done": done,
+                "info": info,
+                "old_q": self.Q[state][action_index],
+                "next_max_q": 0.0,
+                "target": 0.0,
+                "td_error": 0.0,
+                "new_q": self.Q[state][action_index],
+                "choose_reason": "演示：按当前 Q 表贪心选择",
+            }
+            plan.append(item)
             state = next_state
+            simulated_episode_steps += 1
             if done:
                 break
         return plan
 
     def demo_current_policy(self) -> None:
         self.stop_auto()
-        plan = self.greedy_plan_from_q()
-        if not plan:
-            self.log("\n当前策略还没有形成可演示方案，可以先训练几百回合。\n")
+        self.demo_plan = self.greedy_plan_from_q(max_steps=24)
+        if not self.demo_plan:
+            self.log("\n当前策略还没有形成有效方案。可以先训练几百或几千回合。\n")
             return
-        final_time = self.env.makespan(plan[-1].next_state[3])
-        self.log("\n演示当前 Q 表策略：\n")
-        self.log(self.solution_summary_text(plan, final_time) + "\n")
-        self.start_demo(plan)
+        final_state = self.demo_plan[-1]["next_state"]
+        final_time = self.makespan(final_state[4])
+        self.log("\n演示当前 Q 表学到的策略：\n")
+        self.log(self.solution_summary_text(self.demo_plan, final_time) + "\n")
+        self.start_demo(self.demo_plan)
 
     def demo_best_solution(self) -> None:
         self.stop_auto()
         if self.best_solution is None:
-            self.log("\n目前还没有成功方案。可以先点【训练1000回合】或【训练到ε阈值】。\n")
+            self.log("\n目前还没有成功方案。建议先点【训练1000回合】或【训练到ε阈值】。\n")
             return
-        self.log(
-            f"\n演示历史最好方案：总时间 {self.best_solution['time']}s，"
-            f"来自第 {self.best_solution['episode']} 回合。\n"
-        )
+        self.log(f"\n演示历史最好方案：总时间 {self.best_solution['time']}s，来自第 {self.best_solution['episode']} 回合。\n")
         self.log(self.solution_summary_text(self.best_solution["plan"], self.best_solution["time"]) + "\n")
         self.start_demo(self.best_solution["plan"])
 
-    def start_demo(self, plan: List[StepRecord]) -> None:
+    def start_demo(self, plan) -> None:
         self.demo_plan = plan
         self.demo_index = 0
         self.demo_running = True
-        self.display_state = self.env.start_state()
-        self.last_move_path = []
+        self.display_state = self.start_state
+        self.last_move_path = None
         self.demo_loop()
 
     def demo_loop(self) -> None:
@@ -605,125 +702,115 @@ class App:
             self.demo_running = False
             self.update_status("方案演示结束。")
             return
-        record = self.demo_plan[self.demo_index]
-        self.display_state = record.next_state
-        self.last_move_path = record.info.get("path", [])
-        self.last_transition = record
+        item = self.demo_plan[self.demo_index]
+        self.display_state = item["next_state"]
+        self.last_move_path = item["info"].get("path", [])
+        self.last_transition = item
         self.demo_index += 1
         self.draw_grid()
         self.update_action_table()
-        self.update_status("正在演示方案，不更新Q表。")
-        self.root.after(900, self.demo_loop)
+        self.update_status("正在演示方案，不更新 Q 表。")
+        self.root.after(850, self.demo_loop)
 
-    # ---------------------- summaries and export ----------------------
-    def solution_summary_text(self, plan: List[StepRecord], final_time: int) -> str:
-        owner = {task_name: None for task_name in self.env.task_names}
-        lines_by_agent = {ag: [] for ag in self.env.agents}
-        time_by_agent = {ag: 0 for ag in self.env.agents}
-
+    def solution_summary_text(self, plan, final_time: int) -> str:
+        owner = {}
+        lines_by_agent = {ag: [] for ag in self.agents}
         for item in plan:
-            ag, target = self.env.actions[item.action_index]
+            ag, target = self.actions[item["action_index"]]
             if target != "GOAL":
                 owner[target] = ag
                 lines_by_agent[ag].append(f"任务{target}")
             else:
                 lines_by_agent[ag].append("终点")
-            time_by_agent[ag] = item.next_state[3][self.env.agent_index[ag]]
-
         lines = [f"学习得到的任务归属：{owner}"]
-        for ag in self.env.agents:
-            route = " → ".join(lines_by_agent[ag]) if lines_by_agent[ag] else "未行动"
-            lines.append(f"{ag}: {route}，累计耗时 {time_by_agent[ag]}s")
+        for ag in self.agents:
+            seq = " → ".join(lines_by_agent[ag]) if lines_by_agent[ag] else "无动作"
+            lines.append(f"{ag}: {seq}")
         lines.append(f"总完成时间 makespan = {final_time}s")
         return "\n".join(lines)
 
-    def export_results(self) -> None:
-        out_dir = Path("results")
-        out_dir.mkdir(exist_ok=True)
-        csv_path = out_dir / "training_results.csv"
-        with csv_path.open("w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=["episode", "success", "time", "epsilon", "reason"])
-            writer.writeheader()
-            writer.writerows(self.episode_results)
-
-        txt_path = out_dir / "best_solution.txt"
-        with txt_path.open("w", encoding="utf-8") as f:
-            if self.best_solution is None:
-                f.write("暂无成功方案。\n")
-            else:
-                f.write(f"历史最好方案：第 {self.best_solution['episode']} 回合，总时间 {self.best_solution['time']}s\n")
-                f.write(self.solution_summary_text(self.best_solution["plan"], self.best_solution["time"]))
-                f.write("\n\n详细步骤：\n")
-                for i, item in enumerate(self.best_solution["plan"], start=1):
-                    f.write(f"{i}. {self.env.format_action(item.action_index)} | {item.info['reason']}\n")
-        messagebox.showinfo("导出完成", f"已导出到：\n{csv_path}\n{txt_path}")
-
-    # ---------------------- UI ----------------------
+    # ============================================================
+    # UI construction
+    # ============================================================
     def build_ui(self) -> None:
         main = tk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
         left = tk.Frame(main)
         left.pack(side=tk.LEFT, fill=tk.BOTH, expand=False)
+
         right = tk.Frame(main)
         right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(15, 0))
 
         self.canvas_size = 600
-        self.cell = self.canvas_size // self.env.grid_size
+        self.cell = self.canvas_size // self.grid_size
         self.canvas = tk.Canvas(left, width=self.canvas_size, height=self.canvas_size, bg="white")
         self.canvas.pack()
 
         legend = (
-            "v1.0 静态任务版本：A/B/C 初始都在 (0,0)，终点是 (5,5)。\n"
-            "任务 a,b,c,d,e 必须全部完成；圆圈内显示：任务名/执行时间/可执行机器人。\n"
-            "Q-learning 不预设分配方案，通过试错学习谁去做什么任务。\n"
-            "总时间 = max(tA,tB,tC)，因为机器人并行执行。"
+            "v2.0：动态任务 + 持续探索。\n"
+            "A/B/C 从 (0,0) 出发，最终都要到 (5,5)。\n"
+            "初始任务 a-e 激活；动态任务 f 在第 3 个宏动作后出现，也可手动触发。\n"
+            "圆圈内显示：任务名 / 执行时间 / 优先级 / 可执行机器人。灰色表示已完成。"
         )
         tk.Label(left, text=legend, justify=tk.LEFT, wraplength=600).pack(pady=8)
 
         param_frame = ttk.LabelFrame(right, text="参数设置")
         param_frame.pack(fill=tk.X, pady=(0, 8))
 
-        ttk.Label(param_frame, text="学习率 α").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        ttk.Entry(param_frame, textvariable=self.alpha, width=8).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Label(param_frame, text="折扣因子 γ").grid(row=0, column=2, padx=5, pady=5, sticky="w")
-        ttk.Entry(param_frame, textvariable=self.gamma, width=8).grid(row=0, column=3, padx=5, pady=5)
-        ttk.Label(param_frame, text="探索率 ε").grid(row=0, column=4, padx=5, pady=5, sticky="w")
-        ttk.Entry(param_frame, textvariable=self.epsilon, width=8).grid(row=0, column=5, padx=5, pady=5)
-        ttk.Label(param_frame, text="训练到 ε <").grid(row=0, column=6, padx=5, pady=5, sticky="w")
-        ttk.Entry(param_frame, textvariable=self.target_epsilon, width=8).grid(row=0, column=7, padx=5, pady=5)
+        ttk.Label(param_frame, text="学习率 α").grid(row=0, column=0, padx=4, pady=5, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.alpha, width=7).grid(row=0, column=1, padx=4, pady=5)
+
+        ttk.Label(param_frame, text="折扣因子 γ").grid(row=0, column=2, padx=4, pady=5, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.gamma, width=7).grid(row=0, column=3, padx=4, pady=5)
+
+        ttk.Label(param_frame, text="探索率 ε").grid(row=0, column=4, padx=4, pady=5, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.epsilon, width=8).grid(row=0, column=5, padx=4, pady=5)
+
+        ttk.Label(param_frame, text="训练到 ε <").grid(row=0, column=6, padx=4, pady=5, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.target_epsilon, width=8).grid(row=0, column=7, padx=4, pady=5)
+
+        ttk.Label(param_frame, text="事件ε提升至").grid(row=1, column=0, padx=4, pady=5, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.event_epsilon_boost, width=7).grid(row=1, column=1, padx=4, pady=5)
+
+        ttk.Label(param_frame, text="无改进提升间隔").grid(row=1, column=2, padx=4, pady=5, sticky="w")
+        ttk.Entry(param_frame, textvariable=self.stagnation_boost_after, width=7).grid(row=1, column=3, padx=4, pady=5)
 
         button_frame = ttk.LabelFrame(right, text="训练控制")
         button_frame.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(button_frame, text="单步训练", command=self.train_one_step).grid(row=0, column=0, padx=5, pady=5)
-        ttk.Button(button_frame, text="训练100回合", command=lambda: self.auto_train_episodes(100)).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(button_frame, text="训练1000回合", command=lambda: self.auto_train_episodes(1000)).grid(row=0, column=2, padx=5, pady=5)
-        ttk.Button(button_frame, text="训练到ε阈值", command=self.auto_train_until_epsilon).grid(row=0, column=3, padx=5, pady=5)
-        ttk.Button(button_frame, text="演示当前策略", command=self.demo_current_policy).grid(row=1, column=0, padx=5, pady=5)
-        ttk.Button(button_frame, text="演示历史最好", command=self.demo_best_solution).grid(row=1, column=1, padx=5, pady=5)
-        ttk.Button(button_frame, text="导出结果", command=self.export_results).grid(row=1, column=2, padx=5, pady=5)
-        ttk.Button(button_frame, text="停止", command=self.stop_auto).grid(row=1, column=3, padx=5, pady=5)
-        ttk.Button(button_frame, text="重置", command=self.reset_all).grid(row=1, column=4, padx=5, pady=5)
+
+        ttk.Button(button_frame, text="单步训练", command=self.train_one_step).grid(row=0, column=0, padx=4, pady=5)
+        ttk.Button(button_frame, text="训练100回合", command=lambda: self.auto_train_episodes(100)).grid(row=0, column=1, padx=4, pady=5)
+        ttk.Button(button_frame, text="训练1000回合", command=lambda: self.auto_train_episodes(1000)).grid(row=0, column=2, padx=4, pady=5)
+        ttk.Button(button_frame, text="训练到ε阈值", command=self.auto_train_until_epsilon).grid(row=0, column=3, padx=4, pady=5)
+        ttk.Button(button_frame, text="手动触发任务f", command=self.manual_trigger_dynamic_task).grid(row=0, column=4, padx=4, pady=5)
+
+        ttk.Button(button_frame, text="演示当前策略", command=self.demo_current_policy).grid(row=1, column=0, padx=4, pady=5)
+        ttk.Button(button_frame, text="演示历史最好", command=self.demo_best_solution).grid(row=1, column=1, padx=4, pady=5)
+        ttk.Button(button_frame, text="停止", command=self.stop_auto).grid(row=1, column=2, padx=4, pady=5)
+        ttk.Button(button_frame, text="重置", command=self.reset_all).grid(row=1, column=3, padx=4, pady=5)
 
         status_frame = ttk.LabelFrame(right, text="当前信息")
         status_frame.pack(fill=tk.X, pady=(0, 8))
         self.status_label = tk.Label(status_frame, text="", justify=tk.LEFT, anchor="w")
         self.status_label.pack(fill=tk.X, padx=8, pady=6)
 
-        table_frame = ttk.LabelFrame(right, text="当前状态下可选择动作的 Q 值")
+        table_frame = ttk.LabelFrame(right, text="当前状态下可选择的合法动作 Q 值")
         table_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
         columns = ("rank", "action", "q", "cost", "new_time", "reward")
         self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=9)
-        for col, title, width in [
-            ("rank", "序号", 50),
-            ("action", "动作", 130),
-            ("q", "Q值", 90),
-            ("cost", "动作耗时", 90),
-            ("new_time", "动作后总时间", 110),
-            ("reward", "奖励", 90),
-        ]:
-            self.tree.heading(col, text=title)
-            self.tree.column(col, width=width, anchor="center")
+        self.tree.heading("rank", text="序号")
+        self.tree.heading("action", text="动作")
+        self.tree.heading("q", text="Q值")
+        self.tree.heading("cost", text="动作耗时")
+        self.tree.heading("new_time", text="动作后总时间")
+        self.tree.heading("reward", text="奖励")
+        self.tree.column("rank", width=50, anchor="center")
+        self.tree.column("action", width=130, anchor="center")
+        self.tree.column("q", width=90, anchor="center")
+        self.tree.column("cost", width=90, anchor="center")
+        self.tree.column("new_time", width=110, anchor="center")
+        self.tree.column("reward", width=90, anchor="center")
         self.tree.pack(fill=tk.BOTH, expand=True)
 
         log_frame = ttk.LabelFrame(right, text="训练日志与公式代入")
@@ -731,63 +818,76 @@ class App:
         self.log_box = scrolledtext.ScrolledText(log_frame, height=13, wrap=tk.WORD)
         self.log_box.pack(fill=tk.BOTH, expand=True)
 
+    # ============================================================
+    # Drawing and display
+    # ============================================================
     def draw_grid(self) -> None:
         self.canvas.delete("all")
         state = self.current_display_state()
-        positions, completed_mask, done_mask, _times = state
+        positions, active_mask, completed_mask, done_mask, times = state
 
-        for r in range(self.env.grid_size):
-            for c in range(self.env.grid_size):
-                x1 = c * self.cell
-                y1 = r * self.cell
-                x2 = x1 + self.cell
-                y2 = y1 + self.cell
+        for r in range(self.grid_size):
+            for c in range(self.grid_size):
+                x1, y1 = c * self.cell, r * self.cell
+                x2, y2 = x1 + self.cell, y1 + self.cell
                 pos = (r, c)
                 fill = "#ffffff"
-                if pos == self.env.start_pos:
+                if pos == self.start_pos:
                     fill = "#e8f3ff"
-                if pos == self.env.goal_pos:
+                if pos == self.goal_pos:
                     fill = "#d9ffd9"
                 self.canvas.create_rectangle(x1, y1, x2, y2, fill=fill, outline="#999999")
                 self.canvas.create_text(x1 + 18, y1 + 14, text=f"{r},{c}", font=("Arial", 8), fill="#555555")
 
-        # goal
-        gx, gy = self.cell_center(self.env.goal_pos)
+        # Goal
+        gx, gy = self.cell_center(self.goal_pos)
         self.canvas.create_rectangle(gx - 30, gy - 20, gx + 30, gy + 20, fill="#6ccf6c", outline="")
         self.canvas.create_text(gx, gy, text="终点", font=("Arial", 12, "bold"), fill="white")
 
-        # tasks
-        for task_name in self.env.task_names:
-            task = self.env.tasks[task_name]
+        # Tasks
+        for task_name in self.task_names:
+            task = self.tasks[task_name]
             cx, cy = self.cell_center(task.pos)
-            completed = self.env.task_completed(completed_mask, task_name)
-            color = "#bdbdbd" if completed else "#ffb74d"
-            text_color = "#ffffff" if completed else "#000000"
-            cap = "".join(task.capable)
-            label = f"{task_name}\n{task.duration}s\n{cap}"
-            if completed:
-                label = f"{task_name}✓\n{task.duration}s\n{cap}"
-            self.canvas.create_oval(cx - 25, cy - 25, cx + 25, cy + 25, fill=color, outline="#7a4a00", width=2)
-            self.canvas.create_text(cx, cy, text=label, font=("Arial", 9, "bold"), fill=text_color)
+            active = self.task_active(active_mask, task_name)
+            completed = active and self.task_completed(completed_mask, task_name)
+            if not active:
+                color = "#f0f0f0"
+                outline = "#b0b0b0"
+                text_color = "#888888"
+            elif completed:
+                color = "#bdbdbd"
+                outline = "#777777"
+                text_color = "#ffffff"
+            else:
+                color = "#ffb74d" if task_name != "f" else "#ff7043"
+                outline = "#7a4a00"
+                text_color = "#000000"
+            cap = "".join(sorted(task.capable))
+            title = f"{task_name}" + ("✓" if completed else "")
+            if not active:
+                title = f"{task_name}?"
+            label = f"{title}\n{task.duration}s P{task.priority}\n{cap}"
+            self.canvas.create_oval(cx - 27, cy - 27, cx + 27, cy + 27, fill=color, outline=outline, width=2)
+            self.canvas.create_text(cx, cy, text=label, font=("Arial", 8, "bold"), fill=text_color)
 
-        # last path
+        # Last path
         if self.last_move_path and len(self.last_move_path) >= 2:
-            pts: List[float] = []
+            pts = []
             for p in self.last_move_path:
                 pts.extend(self.cell_center(p))
             self.canvas.create_line(*pts, fill="#ff5252", width=4, arrow=tk.LAST)
 
+        # Agents, with offsets for same cell
         offsets = {"A": (-18, -18), "B": (18, -18), "C": (0, 18)}
         colors = {"A": "#e53935", "B": "#1e88e5", "C": "#43a047"}
-        for ag in self.env.agents:
-            i = self.env.agent_index[ag]
+        for ag in self.agents:
+            i = self.agent_index[ag]
             pos = positions[i]
             cx, cy = self.cell_center(pos)
             ox, oy = offsets[ag]
-            color = colors[ag]
-            if self.env.agent_done(done_mask, ag):
-                color = "#757575"
-            self.canvas.create_oval(cx + ox - 17, cy + oy - 17, cx + ox + 17, cy + oy + 17, fill=color, outline="white", width=2)
+            color = "#757575" if self.agent_done(done_mask, ag) else colors[ag]
+            self.canvas.create_oval(cx + ox - 17, cy + oy - 17, cx + ox + 17, cy + oy + 17,
+                                    fill=color, outline="white", width=2)
             self.canvas.create_text(cx + ox, cy + oy, text=ag, fill="white", font=("Arial", 12, "bold"))
 
     def cell_center(self, pos: Position) -> Tuple[float, float]:
@@ -798,28 +898,31 @@ class App:
         for item in self.tree.get_children():
             self.tree.delete(item)
         state = self.current_display_state()
-        legal = self.env.legal_actions(state)
+        legal = self.legal_actions(state)
         rows = []
         for idx in legal:
-            next_state, reward, _done, info = self.env.transition(state, idx)
-            q = self.agent.Q[state][idx]
+            next_state, reward, done, info = self.transition(state, idx)
+            q = self.Q[state][idx]
             rows.append((idx, q, info["action_time"], info["new_makespan"], reward))
         rows.sort(key=lambda x: x[1], reverse=True)
         for rank, (idx, q, action_time, new_makespan, reward) in enumerate(rows, start=1):
-            self.tree.insert("", tk.END, values=(rank, self.env.format_action(idx), f"{q:.3f}", f"{action_time}s", f"{new_makespan}s", f"{reward:.2f}"))
+            values = (rank, self.format_action(idx), f"{q:.3f}", f"{action_time}s", f"{new_makespan}s", f"{reward:.2f}")
+            self.tree.insert("", tk.END, values=values)
 
     def update_status(self, extra_msg: Optional[str] = None) -> None:
         state = self.current_display_state()
-        positions, completed_mask, done_mask, times = state
-        completed = self.env.completed_task_names(completed_mask)
-        remaining = self.env.remaining_task_names(completed_mask)
-        done_agents = [ag for ag in self.env.agents if self.env.agent_done(done_mask, ag)]
-        makespan = self.env.makespan(times)
-        legal = self.env.legal_actions(state)
+        positions, active_mask, completed_mask, done_mask, times = state
+        active = self.active_task_names(active_mask)
+        inactive = self.inactive_task_names(active_mask)
+        completed = self.completed_task_names(active_mask, completed_mask)
+        remaining = self.remaining_task_names(active_mask, completed_mask)
+        done_agents = [ag for ag in self.agents if self.agent_done(done_mask, ag)]
+        makespan = self.makespan(times)
+        legal = self.legal_actions(state)
         if legal:
-            q_values = self.agent.Q[state]
+            q_values = self.Q[state]
             best_idx = max(legal, key=lambda i: q_values[i])
-            best_action = self.env.format_action(best_idx)
+            best_action = self.format_action(best_idx)
             best_q = q_values[best_idx]
         else:
             best_action = "无"
@@ -829,42 +932,43 @@ class App:
             f"回合：{self.episode}，本回合动作数：{self.episode_steps}，总训练步数：{self.total_steps}\n"
             f"A位置={positions[0]}，B位置={positions[1]}，C位置={positions[2]}\n"
             f"A/B/C累计耗时：{times}，当前总时间 makespan={makespan}s\n"
-            f"已完成任务：{completed if completed else '无'}\n"
-            f"剩余任务：{remaining if remaining else '无'}\n"
+            f"激活任务：{active if active else '无'}；未激活任务：{inactive if inactive else '无'}\n"
+            f"已完成任务：{completed if completed else '无'}；剩余任务：{remaining if remaining else '无'}\n"
             f"已到终点智能体：{done_agents if done_agents else '无'}\n"
             f"α={self.alpha.get():.3f}，γ={self.gamma.get():.3f}，ε={self.epsilon.get():.5f}，目标 ε<{self.target_epsilon.get():.3f}\n"
-            f"当前最优动作：{best_action}，Q={best_q:.3f}\n"
+            f"事件探索提升阈值={self.event_epsilon_boost.get():.3f}，当前最优动作：{best_action}，Q={best_q:.3f}\n"
             f"历史最好方案：{best_solution_text}"
         )
         if self.last_transition:
             t = self.last_transition
-            info = t.info
+            info = t["info"]
             text += (
-                f"\n\n上一步：{self.env.format_action(t.action_index)}\n"
+                f"\n\n上一步：{self.format_action(t['action_index'])}\n"
                 f"{info['reason']}\n"
                 f"动作耗时={info['action_time']}s，makespan增加={info['delta_makespan']}s\n"
-                f"Q旧值={t.old_q:.3f}，目标值={t.target:.3f}，TD误差={t.td_error:.3f}，Q新值={t.new_q:.3f}"
+                f"Q旧值={t['old_q']:.3f}，目标值={t['target']:.3f}，TD误差={t['td_error']:.3f}，Q新值={t['new_q']:.3f}"
             )
         if extra_msg:
             text += f"\n\n{extra_msg}"
         self.status_label.config(text=text)
 
-    def log_transition(self, t: StepRecord) -> None:
-        info = t.info
+    def log_transition(self) -> None:
+        t = self.last_transition
+        info = t["info"]
         msg = (
             f"第 {self.total_steps} 步 | 回合 {self.episode}\n"
-            f"状态 S：{self.env.format_state_short(t.state)}\n"
-            f"动作 U：{self.env.format_action(t.action_index)}，{t.choose_reason}\n"
+            f"状态 S：{self.format_state_short(t['state'])}\n"
+            f"动作 U：{self.format_action(t['action_index'])}，{t['choose_reason']}\n"
             f"环境反馈：{info['reason']}\n"
             f"动作耗时：移动 {info['move_time']}s + 任务 {info['task_time']}s = {info['action_time']}s\n"
             f"旧 makespan={info['old_makespan']}s，新 makespan={info['new_makespan']}s，增加 {info['delta_makespan']}s\n"
-            f"奖励 r={t.reward:.2f}\n"
-            f"新状态 S'：{self.env.format_state_short(t.next_state)}\n"
+            f"奖励 r={t['reward']:.2f}\n"
+            f"新状态 S'：{self.format_state_short(t['next_state'])}\n"
             f"更新公式：Q(S,U) ← Q(S,U) + α[r + γ maxQ(S',U') - Q(S,U)]\n"
-            f"代入：{t.old_q:.3f} + {self.alpha.get():.3f} * "
-            f"[{t.reward:.3f} + {self.gamma.get():.3f} * {t.next_max_q:.3f} - {t.old_q:.3f}]\n"
-            f"目标值={t.target:.3f}，TD误差={t.td_error:.3f}，新Q值={t.new_q:.3f}\n"
-            + "-" * 88 + "\n"
+            f"代入：{t['old_q']:.3f} + {self.alpha.get():.3f} * "
+            f"[{t['reward']:.3f} + {self.gamma.get():.3f} * {t['next_max_q']:.3f} - {t['old_q']:.3f}]\n"
+            f"目标值={t['target']:.3f}，TD误差={t['td_error']:.3f}，新Q值={t['new_q']:.3f}\n"
+            + "-" * 92 + "\n"
         )
         self.log(msg)
 
@@ -873,11 +977,7 @@ class App:
         self.log_box.see(tk.END)
 
 
-def main() -> None:
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
-
-
 if __name__ == "__main__":
-    main()
+    root = tk.Tk()
+    app = DynamicMultiAgentQLearningGUI(root)
+    root.mainloop()

@@ -1,2 +1,2 @@
-# v1.0 uses only Python standard library.
-# tkinter is usually included with Python on Windows/macOS.
+# v2.0 uses Python standard library only.
+# Recommended Python version: 3.9+
